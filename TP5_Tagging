@@ -1,1 +1,390 @@
+import logging
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
+import torch
+import unicodedata
+import string
+from tqdm import tqdm
+from pathlib import Path
+from typing import List
+import random
+import time
+import re
+from torch.utils.tensorboard import SummaryWriter
 
+
+
+
+logging.basicConfig(level=logging.INFO)
+
+FILE = "./mes_projets/AMAL/student_tp5/data/en-fra.txt"
+
+writer = SummaryWriter("/tmp/runs/tag-"+time.asctime())
+
+def normalize(s):
+    return re.sub(' +',' ', "".join(c if c in string.ascii_letters else " "
+         for c in unicodedata.normalize('NFD', s.lower().strip())
+         if  c in string.ascii_letters+" "+string.punctuation)).strip()
+
+
+class Vocabulary:
+    """Permet de gérer un vocabulaire.
+
+    En test, il est possible qu'un mot ne soit pas dans le
+    vocabulaire : dans ce cas le token "__OOV__" est utilisé.
+    Attention : il faut tenir compte de cela lors de l'apprentissage !
+
+    Utilisation:
+
+    - en train, utiliser v.get("blah", adding=True) pour que le mot soit ajouté
+      automatiquement
+    - en test, utiliser v["blah"] pour récupérer l'ID du mot (ou l'ID de OOV)
+    """
+    PAD = 0
+    EOS = 1
+    SOS = 2
+    OOVID = 3
+
+    def __init__(self, oov: bool):
+        self.oov = oov
+        self.id2word = ["PAD", "EOS", "SOS"]
+        self.word2id = {"PAD": Vocabulary.PAD, "EOS": Vocabulary.EOS, "SOS": Vocabulary.SOS}
+        if oov:
+            self.word2id["__OOV__"] = Vocabulary.OOVID
+            self.id2word.append("__OOV__")
+
+    def __getitem__(self, word: str):
+        if self.oov:
+            return self.word2id.get(word, Vocabulary.OOVID)
+        return self.word2id[word]
+
+    def get(self, word: str, adding=True):
+        try:
+            return self.word2id[word]
+        except KeyError:
+            if adding:
+                wordid = len(self.id2word)
+                self.word2id[word] = wordid
+                self.id2word.append(word)
+                return wordid
+            if self.oov:
+                return Vocabulary.OOVID
+            raise
+
+    def __len__(self):
+        return len(self.id2word)
+
+    def getword(self, idx: int):
+        if idx < len(self):
+            return self.id2word[idx]
+        return None
+
+    def getwords(self, idx: List[int]):
+        return [self.getword(i) for i in idx]
+
+
+
+class TradDataset():
+    def __init__(self,data,vocOrig,vocDest,adding=True,max_len=10):
+        self.sentences =[]
+        for s in tqdm(data.split("\n")):
+            if len(s)<1:continue
+            orig,dest=map(normalize,s.split("\t")[:2])
+            if len(orig)>max_len: continue
+            self.sentences.append((torch.tensor([vocOrig.get(o) for o in orig.split(" ")]+[Vocabulary.EOS]),torch.tensor([vocDest.get(o) for o in dest.split(" ")]+[Vocabulary.EOS])))
+    def __len__(self):return len(self.sentences)
+    def __getitem__(self,i): return self.sentences[i]
+
+
+
+def collate_fn(batch):
+    orig,dest = zip(*batch)
+    o_len = torch.tensor([len(o) for o in orig])
+    d_len = torch.tensor([len(d) for d in dest])
+    return pad_sequence(orig),o_len,pad_sequence(dest),d_len
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+with open(FILE) as f:
+    lines = f.readlines()
+
+lines = [lines[x] for x in torch.randperm(len(lines))]
+idxTrain = int(0.8*len(lines))
+
+vocEng = Vocabulary(True)
+vocFra = Vocabulary(True)
+MAX_LEN=100
+BATCH_SIZE=100
+
+datatrain = TradDataset("".join(lines[:idxTrain]),vocEng,vocFra,max_len=MAX_LEN)
+datatest = TradDataset("".join(lines[idxTrain:]),vocEng,vocFra,max_len=MAX_LEN)
+
+train_loader = DataLoader(datatrain, collate_fn=collate_fn, batch_size=BATCH_SIZE, shuffle=True)
+test_loader = DataLoader(datatest, collate_fn=collate_fn, batch_size=BATCH_SIZE, shuffle=True)
+
+#  TODO:  Implémenter l'encodeur, le décodeur et la boucle d'apprentissage
+# Ajouter après le code existant
+# Ajouter après le code existant
+
+class Encoder(nn.Module):
+    def __init__(self, vocab_size, emb_size, hidden_size, dropout=0.5):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, emb_size)
+        self.gru = nn.GRU(emb_size, hidden_size, num_layers=2, dropout=dropout, batch_first=False)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, src, src_lengths):
+        # src: [seq_len, batch_size]
+        embedded = self.dropout(self.embedding(src))
+        
+        # Pack padded sequences for efficiency
+        packed = nn.utils.rnn.pack_padded_sequence(embedded, src_lengths.cpu(), enforce_sorted=False)
+        _, hidden = self.gru(packed)
+        return hidden
+
+class Decoder(nn.Module):
+    def __init__(self, vocab_size, emb_size, hidden_size, dropout=0.5):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, emb_size)
+        self.gru = nn.GRU(emb_size, hidden_size, num_layers=2, dropout=dropout, batch_first=False)
+        self.out = nn.Linear(hidden_size, vocab_size)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, input, hidden):
+        # input: [1, batch_size]
+        embedded = self.dropout(self.embedding(input))
+        output, hidden = self.gru(embedded, hidden)
+        prediction = self.out(output.squeeze(0))
+        return prediction, hidden
+    
+    def generate(self, hidden, sos_idx, eos_idx, max_len=50):
+        """Génère une séquence à partir d'un état caché"""
+        device = hidden.device
+        batch_size = hidden.shape[1]
+        
+        with torch.no_grad():
+            input = torch.full((1, batch_size), sos_idx, device=device)
+            hidden = hidden
+            outputs = []
+            
+            for _ in range(max_len):
+                output, hidden = self(input, hidden)
+                predicted = output.argmax(1).unsqueeze(0)
+                outputs.append(predicted)
+                
+                if (predicted == eos_idx).all():
+                    break
+                    
+                input = predicted
+                
+            return torch.cat(outputs, dim=0)
+
+class Seq2SeqModel(nn.Module):
+    def __init__(self, encoder, decoder, device):
+        super().__init__()
+        self.encoder = encoder.to(device)
+        self.decoder = decoder.to(device)
+        self.device = device
+        
+    def forward(self, src, tgt, src_len, teacher_forcing_ratio=0.5):
+        batch_size = src.shape[1]
+        max_len = tgt.shape[0]
+        tgt_vocab_size = self.decoder.out.out_features
+        
+        outputs = torch.zeros(max_len, batch_size, tgt_vocab_size).to(self.device)
+        hidden = self.encoder(src, src_len)
+        
+        # Premier token = SOS
+        decoder_input = tgt[0, :].unsqueeze(0)
+        
+        for t in range(1, max_len):
+            output, hidden = self.decoder(decoder_input, hidden)
+            outputs[t] = output
+            
+            # Décision teacher forcing
+            use_teacher_forcing = random.random() < teacher_forcing_ratio
+            decoder_input = tgt[t].unsqueeze(0) if use_teacher_forcing else output.argmax(1).unsqueeze(0)
+            
+        return outputs
+    
+    def translate(self, src, src_len):
+        hidden = self.encoder(src, src_len)
+        return self.decoder.generate(hidden, Vocabulary.SOS, Vocabulary.EOS)
+
+# Paramètres d'entraînement
+EMBEDDING_SIZE = 256
+HIDDEN_SIZE = 512
+DROPOUT = 0.5
+N_EPOCHS = 20
+LEARNING_RATE = 0.001
+CLIP = 1.0
+
+# Création des modèles
+encoder = Encoder(len(vocEng), EMBEDDING_SIZE, HIDDEN_SIZE, DROPOUT)
+decoder = Decoder(len(vocFra), EMBEDDING_SIZE, HIDDEN_SIZE, DROPOUT)
+model = Seq2SeqModel(encoder, decoder, device)
+
+# Optimizer et loss
+optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+criterion = nn.CrossEntropyLoss(ignore_index=Vocabulary.PAD)
+
+def train_epoch(model, train_loader, optimizer, criterion, clip, teacher_forcing_ratio):
+    model.train()
+    epoch_loss = 0
+    
+    for batch in tqdm(train_loader, desc="Training"):
+        src, src_len, tgt, tgt_len = batch
+        src, tgt = src.to(device), tgt.to(device)
+        
+        optimizer.zero_grad()
+        output = model(src, tgt, src_len, teacher_forcing_ratio)
+        
+        loss = 0
+        for t in range(1, tgt.size(0)):
+            loss += criterion(output[t], tgt[t])
+            
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+        optimizer.step()
+        
+        epoch_loss += loss.item()
+        
+    return epoch_loss / len(train_loader)
+
+def evaluate(model, data_loader, criterion):
+    model.eval()
+    epoch_loss = 0
+    
+    with torch.no_grad():
+        for batch in tqdm(data_loader, desc="Evaluating"):
+            src, src_len, tgt, tgt_len = batch
+            src, tgt = src.to(device), tgt.to(device)
+            
+            output = model(src, tgt, src_len, teacher_forcing_ratio=0)
+            
+            loss = 0
+            for t in range(1, tgt.size(0)):
+                loss += criterion(output[t], tgt[t])
+                
+            epoch_loss += loss.item()
+            
+    return epoch_loss / len(data_loader)
+
+# Question 3: Ajout de SentencePiece
+import sentencepiece as spm
+
+def setup_sentencepiece():
+    spm.SentencePieceTrainer.train(
+        input=FILE,
+        model_prefix='spm_model',
+        vocab_size=8000,
+        character_coverage=1.0,
+        model_type='bpe',
+        pad_id=0,
+        eos_id=1,
+        unk_id=2,
+        bos_id=3
+    )
+    return spm.SentencePieceProcessor(model_file='spm_model.model')
+
+class TradDatasetSPM(Dataset):
+    def __init__(self, data, sp_model, max_len=MAX_LEN):
+        self.sentences = []
+        for s in tqdm(data.split("\n"), desc="Loading data"):
+            if len(s) < 1: continue
+            orig, dest = map(normalize, s.split("\t")[:2])
+            if len(orig) > max_len: continue
+            
+            orig_ids = sp_model.encode(orig, add_bos=True, add_eos=True)
+            dest_ids = sp_model.encode(dest, add_bos=True, add_eos=True)
+            
+            self.sentences.append((
+                torch.tensor(orig_ids),
+                torch.tensor(dest_ids)
+            ))
+    
+    def __len__(self): return len(self.sentences)
+    def __getitem__(self, i): return self.sentences[i]
+
+# Fonction principale d'entraînement
+def train_model(model, train_loader, test_loader, n_epochs, initial_tf_ratio=0.9):
+    best_loss = float('inf')
+    
+    for epoch in range(n_epochs):
+        # Diminution progressive du teacher forcing
+        tf_ratio = max(0.1, initial_tf_ratio - (epoch / n_epochs) * 0.8)
+        
+        train_loss = train_epoch(model, train_loader, optimizer, criterion, CLIP, tf_ratio)
+        test_loss = evaluate(model, test_loader, criterion)
+        
+        writer.add_scalar('Loss/train', train_loss, epoch)
+        writer.add_scalar('Loss/test', test_loss, epoch)
+        writer.add_scalar('teacher_forcing_ratio', tf_ratio, epoch)
+        
+        print(f'Epoch: {epoch+1:02}')
+        print(f'\tTrain Loss: {train_loss:.3f}')
+        print(f'\tTest Loss: {test_loss:.3f}')
+        print(f'\tTeacher Forcing Ratio: {tf_ratio:.3f}')
+        
+        if test_loss < best_loss:
+            best_loss = test_loss
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': best_loss,
+            }, 'best_model.pt')
+
+def translate_sentence(model, sentence, vocEng, vocFra):
+    model.eval()
+    
+    # Préparation de la phrase
+    tokens = sentence.split()
+    tokens = [vocEng.get(token, adding=False) for token in tokens] + [Vocabulary.EOS]
+    src_tensor = torch.LongTensor(tokens).unsqueeze(1).to(device)
+    src_len = torch.LongTensor([len(tokens)])
+    
+    with torch.no_grad():
+        translations = model.translate(src_tensor, src_len)
+    
+    translated_tokens = [vocFra.getword(idx) for idx in translations[:, 0].cpu().numpy()]
+    return ' '.join(token for token in translated_tokens if token not in ['PAD', 'EOS', 'SOS'])
+
+if __name__ == "__main__":
+    # Entraînement standard
+    print("Starting standard training...")
+    train_model(model, train_loader, test_loader, N_EPOCHS)
+    
+    # Test de traduction
+    test_sentence = "I love programming"
+    translation = translate_sentence(model, test_sentence, vocEng, vocFra)
+    print(f"\nTest translation:")
+    print(f"Source: {test_sentence}")
+    print(f"Translation: {translation}")
+    
+    # Version avec SentencePiece
+    print("\nSetting up SentencePiece...")
+    sp_model = setup_sentencepiece()
+    
+    # Création des datasets avec SentencePiece
+    train_data_spm = TradDatasetSPM("".join(lines[:idxTrain]), sp_model)
+    test_data_spm = TradDatasetSPM("".join(lines[idxTrain:]), sp_model)
+    
+    train_loader_spm = DataLoader(train_data_spm, collate_fn=collate_fn, 
+                                batch_size=BATCH_SIZE, shuffle=True)
+    test_loader_spm = DataLoader(test_data_spm, collate_fn=collate_fn, 
+                               batch_size=BATCH_SIZE, shuffle=True)
+    
+    # Création du modèle avec SentencePiece
+    encoder_spm = Encoder(sp_model.get_piece_size(), EMBEDDING_SIZE, HIDDEN_SIZE)
+    decoder_spm = Decoder(sp_model.get_piece_size(), EMBEDDING_SIZE, HIDDEN_SIZE)
+    model_spm = Seq2SeqModel(encoder_spm, decoder_spm, device)
+    
+    # Entraînement avec SentencePiece
+    print("\nStarting SentencePiece training...")
+    train_model(model_spm, train_loader_spm, test_loader_spm, N_EPOCHS)
